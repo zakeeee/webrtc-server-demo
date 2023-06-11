@@ -1,14 +1,9 @@
-import { Server } from 'socket.io';
-
-const io = new Server({
-  cors: {
-    origin: ['https://localhost:3001', 'http://localhost:3000'],
-    methods: ['GET', 'POST'],
-  },
-});
+import { nanoid } from 'nanoid';
+import WebSocket, { WebSocketServer } from 'ws';
 
 type User = {
   id: string;
+  socket: WebSocket;
 };
 
 type CallUserData = {
@@ -26,55 +21,121 @@ type NewIceCandidateData = {
   candidate: unknown;
 };
 
-let users: User[] = [];
+function serialize(data: { type: string; payload: any }) {
+  return JSON.stringify(data);
+}
 
-io.on('connection', (socket) => {
-  console.log('====== new connection', socket.id);
-  const exist = users.find((user) => user.id === socket.id);
-  if (exist) {
-    return;
-  }
+function deserialize(data: any): { type: string; payload: any } {
+  return JSON.parse(data.toString());
+}
 
-  const newUser = {
-    id: socket.id,
-  };
-  users.push(newUser);
-
-  socket.emit('user-list', {
-    users: users.filter((user) => user.id !== newUser.id),
-  });
-
-  socket.broadcast.emit('add-user', {
-    user: newUser,
-  });
-
-  socket.on('disconnect', () => {
-    users = users.filter((user) => user.id !== newUser.id);
-    socket.broadcast.emit('remove-user', {
-      userId: newUser.id,
-    });
-  });
-
-  socket.on('call-user', (data: CallUserData) => {
-    socket.to(data.to).emit('new-call', {
-      from: newUser.id,
-      offer: data.offer,
-    });
-  });
-
-  socket.on('answer-user', (data: AnswerUserData) => {
-    socket.to(data.to).emit('new-answer', {
-      from: newUser.id,
-      answer: data.answer,
-    });
-  });
-
-  socket.on('new-ice-candidate', (data: NewIceCandidateData) => {
-    socket.to(data.to).emit('new-ice-candidate', {
-      from: newUser.id,
-      candidate: data.candidate,
-    });
-  });
+const server = new WebSocketServer({
+  port: 8888,
 });
 
-io.listen(8888);
+const userMap = new Map<string, User>();
+
+server.on('connection', (ws) => {
+  const userId = nanoid();
+  const newUser = {
+    id: userId,
+    socket: ws,
+  };
+  console.log('====== new connection', userId);
+
+  ws.send(
+    serialize({
+      type: 'user-list',
+      payload: {
+        userIds: [...userMap.keys()],
+      },
+    })
+  );
+
+  userMap.set(userId, newUser);
+
+  server.clients.forEach((client) => {
+    if (client !== ws && client.readyState === WebSocket.OPEN) {
+      const data = serialize({
+        type: 'add-user',
+        payload: {
+          userId,
+        },
+      });
+      client.send(data);
+    }
+  });
+
+  ws.on('close', () => {
+    server.clients.forEach((client) => {
+      if (client !== ws && client.readyState === WebSocket.OPEN) {
+        client.send(
+          serialize({
+            type: 'remove-user',
+            payload: {
+              userId,
+            },
+          })
+        );
+      }
+    });
+    userMap.delete(userId);
+  });
+
+  const onCallUser = (data: CallUserData) => {
+    const { to, offer } = data;
+    userMap.get(to)?.socket.send(
+      serialize({
+        type: 'new-call',
+        payload: {
+          from: userId,
+          offer,
+        },
+      })
+    );
+  };
+
+  const onAnswerUser = (data: AnswerUserData) => {
+    const { to, answer } = data;
+    userMap.get(to)?.socket.send(
+      serialize({
+        type: 'new-answer',
+        payload: {
+          from: userId,
+          answer,
+        },
+      })
+    );
+  };
+
+  const onNewIceCandidate = (data: NewIceCandidateData) => {
+    const { to, candidate } = data;
+    userMap.get(to)?.socket.send(
+      serialize({
+        type: 'new-ice-candidate',
+        payload: {
+          from: userId,
+          candidate,
+        },
+      })
+    );
+  };
+
+  ws.on('message', (data) => {
+    const { type, payload } = deserialize(data);
+    switch (type) {
+      case 'call-user': {
+        onCallUser(payload);
+        break;
+      }
+      case 'answer-user': {
+        onAnswerUser(payload);
+        break;
+      }
+      case 'new-ice-candidate': {
+        onNewIceCandidate(payload);
+        break;
+      }
+    }
+  });
+});
